@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -40,6 +41,8 @@ type Client struct {
 	once      sync.Once
 	closeErr  error
 	sequence  byte
+	exchanges uint64
+	trace     atomic.Pointer[traceSink]
 }
 
 // New takes ownership of t. Each operation has a one-second maximum duration
@@ -100,9 +103,14 @@ func (c *Client) exchange(ctx context.Context, command byte, data []byte) ([]byt
 // exchangeLocked requires the transaction gate and a bounded context.
 func (c *Client) exchangeLocked(ctx context.Context, command byte, data []byte) (payload []byte, err error) {
 	transmitted := false
+	c.exchanges++
+	sink := c.trace.Load()
+	event := TraceEvent{Exchange: c.exchanges, Command: command}
 	defer func() {
 		if err != nil {
 			err = &OpError{Command: command, Transmitted: transmitted, Err: err}
+			event.Stage, event.Err, event.Report = "error", err, nil
+			sink.record(event)
 		}
 	}()
 	if err := ctx.Err(); err != nil {
@@ -119,10 +127,14 @@ func (c *Client) exchangeLocked(ctx context.Context, command byte, data []byte) 
 	if err != nil {
 		return nil, err
 	}
+	event.Sequence, event.Stage, event.Report = c.sequence, "write", report
+	sink.record(event)
 	transmitted = true
 	if err = c.transport.WriteReport(ctx, report); err != nil {
 		return nil, c.ioError(ctx, "write", err)
 	}
+	event.Stage, event.Report = "written", nil
+	sink.record(event)
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -132,10 +144,14 @@ func (c *Client) exchangeLocked(ctx context.Context, command byte, data []byte) 
 			return nil, c.ioError(ctx, "read", err)
 		}
 		response, err := decode(report)
+		sink.record(TraceEvent{Exchange: event.Exchange, Stage: "read", Command: command, Sequence: request.sequence,
+			ResponseCommand: response.command, ResponseSequence: response.sequence, Payload: response.data,
+			Valid: err == nil, Matched: err == nil && response.command == command && response.sequence == request.sequence, Report: report, Err: err})
 		if err != nil {
 			return nil, err
 		}
-		// Ignore unsolicited telemetry and late replies from earlier transactions.
+		// Ignore replies with different command/sequence values. An old reply
+		// delayed by a full 256-request cycle cannot be distinguished on the wire.
 		if response.command != command || response.sequence != request.sequence {
 			continue
 		}

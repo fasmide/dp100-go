@@ -50,6 +50,9 @@ func (c *Client) Measurements(ctx context.Context) (Measurements, error) {
 }
 
 // Settings reads the currently active output settings, independent of group.
+// Enabled is the device's reported logical state, not proof of physical output
+// or discharge. A separate Measurements call is not an atomic snapshot with it;
+// transitional inconsistencies and firmware reporting latency are unbounded.
 func (c *Client) Settings(ctx context.Context) (OutputSettings, error) {
 	return c.readSettings(ctx, 0x80)
 }
@@ -185,7 +188,10 @@ func settingsPayload(index byte, enabled bool, l Limits) []byte {
 	return b
 }
 
-// SetEnabled reads the active settings and changes only the output enable state.
+// SetEnabled reads the active settings and requests a change to the enable state.
+// A nil error means only that a matching successful ACK was received: it does
+// NOT verify application, logical readback, or discharge. Use WaitEnabled or
+// explicit Settings/Measurements reads to verify the caller's required state.
 // Enabling can energize the connected load at its existing setpoints. Disabling
 // does not guarantee immediate discharge of the output capacitors.
 // Other operations on this Client cannot interleave with the read/write pair;
